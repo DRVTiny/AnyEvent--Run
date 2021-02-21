@@ -1,5 +1,5 @@
 package AnyEvent::Run;
-our $VERSION = '0.8.7';
+our $VERSION = '0.9.0';
 use constant UNDEF => 'undefined';
 
 use 5.16.1;
@@ -7,6 +7,10 @@ use strict;
 use warnings;
 
 use Ref::Util qw(is_refref is_coderef is_arrayref is_hashref);
+BEGIN {
+    no strict 'refs';
+    *{'AnyEvent::Run::Object::is_hashref'} = \&is_hashref
+}
 use List::Util qw(first);
 use Scalar::Util qw(blessed);
 use AnyEvent;
@@ -50,19 +54,31 @@ sub ae_run_seq {
             ()
         }
     };
+    
     my @callbacks = @_ or croak 'no callbacks provided for chaining';
     sub { 
-        defined( my $cb = shift @callbacks )
-            or return( $opts{'dont_recv'} ? @_ : $cv->send(@_) );
-            
-        (my $opts, $cb) =
-            is_arrayref( $cb )
-              ?  @{$cb}
-              : ( {}, $cb );
-              
-        is_valid_async_cb( $cb )
-            or croak 'all callbacks passed to ae_run_seq() must be code references';
-        
+        my ($cb, $opts) = (shift(@callbacks), {}); 
+        if ( 
+            my $stop_args =
+                $cb
+                  ? sub {
+                      is_arrayref( $cb ) and do {
+                          $cb->[0] and 
+                            is_hashref( $cb->[0] )
+                              ? $opts = $cb->[0]
+                              : return( [undef, 'AE::Run callback options must be hashref'] );
+                          $cb = $cb->[1]
+                      };
+                      is_valid_async_cb( $cb )
+                          ? undef
+                          : [undef, 'All callbacks passed to ae_run_seq() must be code references or condvars']
+                    }->()
+                  : \@_
+        ) {
+            $ae_run->stop( @{$stop_args} )
+        }
+             
+        $ae_run->stop_flag and return;
         unshift @_, __SUB__, $ae_run;
         
         if ( is_coderef(my $repack_args_cb = $opts->{'repack'}) ) {
@@ -76,15 +92,16 @@ sub ae_run_seq {
         # <- Before Each
         
         # On Handler Error ->
+        my $caller_pkg = (caller 0)[0] // UNDEF;
         defined $_[I_ERR]
             and
-        (caller 0)[0] eq 'AnyEvent::HTTP' && is_hashref($_[I_ERR]) && exists($_[I_ERR]{'Status'})
+        $caller_pkg eq 'AnyEvent::HTTP' && is_hashref($_[I_ERR]) && exists($_[I_ERR]{'Status'})
           ? 
-            ($_[I_ERR]{'Status'} =~ /^[23]/)
-                || $on_error_cb->(
-                        @_[0..I_AE_RUN],
-                        sprintf('HTTP Status: %d, Reason: %s', @{$_[I_ERR]}{qw/Status Reason/})
-                    )
+              $_[I_ERR]{'Status'} !~ /^[23]/
+              && $on_error_cb->(
+                    @_[0..I_AE_RUN],
+                    sprintf('HTTP Status: %d, Reason: %s', @{$_[I_ERR]}{qw/Status Reason/})
+                  )
           : &{$on_error_cb}
             and
         return
@@ -95,19 +112,20 @@ sub ae_run_seq {
         
         # On Exception ->
         $on_exception_cb
-            ? do {
-                my $rv = eval { &{$cb} };
-                $@ 
-                    ? do { 
-                        $on_exception_cb->(@_[0..I_RES], $@);
-                        $cv
-                            ? $cv->send(undef, sprintf 'Exception in %s handler #%d: %s', __PACKAGE__, $_[I_AE_RUN]->count, $_[I_ERR])
-                            : undef
-                      }
-                    : $rv
-              }
-            : &{$cb}
+            ? eval { &{$cb} }
+            : &{$cb};
+        
+        if ( $on_exception_cb && $@ ) {
+            $on_exception_cb->(@_[0..I_RES], $@);
+            $ae_run->stop(
+                undef,
+                sprintf 'Exception in %s handler #%d: %s', __PACKAGE__, $_[I_AE_RUN]->count, $_[I_ERR]
+            )
+        }
         # <- On Exception
+        if ( $cv and my @rv = $ae_run->stop) {
+            $cv->send(@rv)
+        }
     }->( @pass_args );
     $cv and $cv->recv
 }
@@ -159,8 +177,10 @@ sub __std_final_cb {
 package AnyEvent::Run::Object;
 use Class::XSAccessor::Array {
     accessors => {
-        cv	=> 0,
-        hold  	=> 1
+        cv		=> 0,
+        hold  		=> 1,
+        stop_flag	=> 3,
+        stop_args	=> 4,
     },
     lvalue_accessors => {
         count => 2
@@ -172,9 +192,22 @@ sub new {
     my ($class, $cv, $hold) = @_;
     bless [
         $cv,
-        $hold && ref($hold) eq 'HASH' ? $hold : {},
+        $hold && is_hashref($hold) ? $hold : {},
         my $count = 0
-    ], ref($class) || $class
+    ], $class
+}
+
+sub stop {
+    my $self = shift;
+    defined(wantarray)
+      ? wantarray
+        ? @{$self->stop_args}
+        : $self->stop_flag
+      : do {
+          $self->stop_args( \@_ );
+          $self->cv and &{$self->cv};
+          $self->stop_flag( 1 )
+        }
 }
 
 1;
